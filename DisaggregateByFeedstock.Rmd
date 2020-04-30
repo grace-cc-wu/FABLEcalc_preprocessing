@@ -1,0 +1,167 @@
+---
+title: "DisaggregateByFeedstock"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## load libraries
+library(tidyr)
+library(dplyr)
+```
+
+## Read csvs and tidy up the column names and data
+```{r}
+supplies <- read.csv("BiomassSuppliesbyState.csv", header= TRUE)
+mapping <- read.csv("stateToRegionMapping.csv", header=TRUE)
+use <- read.csv("biomassUseByZone.csv", header = TRUE)
+
+## change colnames as needed
+colnames(supplies)
+colnames(mapping)
+colnames(mapping) <- c("state", "egrid_agg", "allocator")
+colnames(use)
+colnames(use) <- c("Fuel", "Run.Name", "Year", "egrid_agg", "Dry.Tons.Use.egrid_agg")
+
+## clean up state names (they don't match between the tables because of capitalization)
+supplies <- supplies %>% 
+  mutate(State = tolower(State))
+
+### check that state names are the same (that the supply curve states are in the mapping table)
+unique(supplies$State) %in% unique(mapping$state)
+
+## remove commas and convert factors to numeric
+supplies$Dry.Tons <- as.numeric(as.character(gsub(",", "", supplies$Dry.Tons)))
+```
+
+## Join mapping to supplies table
+This gets the mapping[alloctator] column into the supplies table 
+```{r}
+supplies_zones <- left_join(supplies, mapping, by = c("State" = "state"))
+nrow(supplies_zones)
+nrow(supplies)
+
+## multiply the Dry.Tons by the allocator
+supplies_zones <- supplies_zones %>% 
+  mutate(Dry.Tons.Alloc = Dry.Tons*allocator)
+```
+
+## Prep use table
+```{r}
+use <- use %>% 
+  ## separate the resource form from the price
+  separate(Fuel, c("Resource.Form", "Biomass.Price"), sep = "_", remove = TRUE) %>% 
+  ## Isolate resource form by deleting "biomass primary - "
+  mutate(Resource.Form = gsub("biomass primary - ", "", Resource.Form))
+
+unique(use$Resource.Form)
+nrow(use)
+
+## delete Resource.Form == "corn" rows
+use <- use %>% 
+  filter(Resource.Form != "corn")
+
+##check that rows were removed
+unique(use$Resource.Form)
+nrow(use)
+```
+
+## Prep supplies_zones table: 
+1) remove unnecessary years
+2) duplicate 2040 for 2045 and 2050
+```{r}
+unique(supplies_zones$Year)
+unique(use$Year)
+
+## in supplies_zones: remove all unnecessary years (in between the five year increments)
+supplies_zones_sub <- supplies_zones %>% 
+  filter(Year %in% unique(use$Year))
+
+nrow(supplies_zones_sub)
+
+## duplicate 2040 for 2045 and 2050 in supply curve
+supplies_zones_sub_dup <- rbind(supplies_zones_sub, 
+                            supplies_zones_sub %>% 
+                              filter(Year == 2040) %>%
+                              mutate(Year = 2045))
+
+supplies_zones_sub_dup <- rbind(supplies_zones_sub_dup, 
+                            supplies_zones_sub_dup %>% 
+                              filter(Year == 2040) %>%
+                              mutate(Year = 2050))
+
+nrow(supplies_zones_sub_dup)
+unique(supplies_zones_sub_dup$Year)
+
+## Check that it has the right number of rows
+nrow(filter(supplies_zones_sub_dup, Year == 2040))*2 + nrow(supplies_zones_sub) == nrow(supplies_zones_sub_dup)
+
+#write.csv(supplies_zones_sub_dup, "supplies_zones_sub_dup.csv")
+```
+## Calculate allocation proportions in supplies_zones_sub_dup 
+```{r}
+sum.Dry.Tons.Alloc <- supplies_zones_sub_dup %>% 
+  group_by(Biomass.Price, Resource.Form, Year, egrid_agg) %>%
+  summarise(sum.Dry.Tons.Alloc = sum(Dry.Tons.Alloc))
+
+## join sums to supplies_zones_sub_dup
+supplies_zones_sub_dup <- left_join(supplies_zones_sub_dup, sum.Dry.Tons.Alloc, by = c("Biomass.Price" = "Biomass.Price", "Resource.Form" = "Resource.Form", "egrid_agg" = "egrid_agg", "Year" = "Year"))
+
+## Divide Dry.Tons.Alloc by sum.Dry.Tons.Alloc
+supplies_zones_sub_dup <- supplies_zones_sub_dup %>%
+  mutate(use.allocator = Dry.Tons.Alloc/sum.Dry.Tons.Alloc)
+
+#write.csv(supplies_zones_sub_dup, "supplies_zones_sub_dup_useAlloc.csv")
+```
+
+## join supplies_zones_sub_dup with use table
+This allow the use.allocator to be applied to the Dry.Tons.Use.egrid_agg (selected tons of biomass in each scenario) to calculate the per state and resource allocation.
+```{r}
+# make Resource.Form in supplies table lowercase to match use table
+supplies_zones_sub_dup <- supplies_zones_sub_dup %>%
+  mutate(Resource.Form = tolower(Resource.Form))
+unique(supplies_zones_sub_dup$Resource.Form)
+unique(use$Resource.Form)
+
+## ERR, it's "woody" in supplies table and "wood" in the use table! replace "wood" with "woody" in use table in the Resource.Form column
+use <- use %>%
+  mutate(Resource.Form = replace(Resource.Form, Resource.Form == "wood", "woody"))
+
+unique(use$Resource.Form)
+
+## ALSO, Biomass.Price in supplies table is a character. make it numeric:
+supplies_zones_sub_dup$Biomass.Price <- as.numeric(supplies_zones_sub_dup$Biomass.Price)
+use$Biomass.Price <- as.numeric(use$Biomass.Price)
+
+## Now we can do the join:
+supplies_zones_sub_dup_use <- left_join(supplies_zones_sub_dup, use, by = c("Biomass.Price" = "Biomass.Price", "Resource.Form" = "Resource.Form", "egrid_agg" = "egrid_agg", "Year" = "Year"))
+
+## check that this join was done correctly by ensuring the number of additional rows (multiplied) equal the number of Run.Name scenarios
+length(unique(use$Run.Name)) == nrow(supplies_zones_sub_dup_use)/nrow(supplies_zones_sub_dup)
+
+```
+
+## Calculate the disaggregated biomass usage numbers by lowest dimension (resource within each state), saved as column, Dry.Tons.Use.State
+```{r}
+## Convert all NaNs in the user.allocator (which are 0/0) to 0
+is.nan.data.frame <- function(x)
+do.call(cbind, lapply(x, is.nan))
+
+supplies_zones_sub_dup_use[is.nan.data.frame(supplies_zones_sub_dup_use)] <- 0
+
+supplies_zones_sub_dup_use <- supplies_zones_sub_dup_use %>%
+  mutate(Dry.Tons.Use.State = use.allocator*Dry.Tons.Use.egrid_agg)
+
+#write.csv(supplies_zones_sub_dup_use, "supplies_zones_sub_dup_use.csv")
+```
+
+## Get national sums by Resource
+```{r}
+national_resource <- supplies_zones_sub_dup_use %>%
+  group_by(Resource, Resource.Form, Run.Name, Year) %>%
+  summarise(Dry.Tons.ByResource = sum(Dry.Tons.Use.State))
+
+write.csv(national_resource, "national_resource.csv")
+```
+
